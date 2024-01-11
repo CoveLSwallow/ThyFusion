@@ -1,0 +1,654 @@
+from typing import Callable, List, Optional, Tuple
+from torch import Tensor
+from torchvision.models import GoogLeNet, GoogLeNetOutputs
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import warnings
+class SEBlock(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=8,pool=None):
+        super(SEBlock, self).__init__()
+        # self.pool=pool
+        # if pool:
+        #     self.layer1=nn.Sequential(
+        #     nn.Conv2d(in_channels,in_channels//2,kernel_size=1),
+        #     nn.BatchNorm2d(in_channels//2),
+        #     nn.ReLU(inplace=True))
+        #     in_channels=in_channels//2
+        self.global_pooling = nn.AdaptiveAvgPool2d(1)
+        self.fc1 = nn.Linear(in_channels, in_channels // reduction_ratio)
+        self.relu = nn.ReLU(inplace=True)
+        self.fc2 = nn.Linear(in_channels // reduction_ratio, in_channels)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # if self.pool:
+        #     x=self.layer1(x)
+        batch_size, channels, _, _ = x.size()
+
+        # 全局平均池化
+        squeeze = self.global_pooling(x)
+        squeeze = squeeze.view(batch_size, channels)
+
+        # 第一个全连接层 + 激活函数 (ReLU)
+        excitation = self.fc1(squeeze)
+        excitation = self.relu(excitation)
+
+        # 第二个全连接层 + 激活函数 (Sigmoid)
+        excitation = self.fc2(excitation)
+        excitation = self.sigmoid(excitation)
+
+        # 重塑为通道权重
+        excitation = excitation.view(batch_size, channels, 1, 1)
+
+        # 特征重加权
+        x = x * excitation
+
+        return x
+#用于通过sigmoid计算出两个向量分别所占的比例，然后进行相乘
+class SEBlock_cat(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=8,pool=None):
+        super(SEBlock_cat, self).__init__()
+        # self.pool=pool
+        # if pool:
+        #     self.layer1=nn.Sequential(
+        #     nn.Conv2d(in_channels,in_channels//2,kernel_size=1),
+        #     nn.BatchNorm2d(in_channels//2),
+        #     nn.ReLU(inplace=True))
+        #     in_channels=in_channels//2
+        self.global_pooling = nn.AdaptiveAvgPool2d(1)
+        self.getatt1=nn.Sequential(
+        nn.Linear(in_channels, in_channels // reduction_ratio),
+        nn.ReLU(inplace=True),
+        nn.Linear(in_channels // reduction_ratio, in_channels))
+        self.getatt2=nn.Sequential(
+        nn.Linear(in_channels, in_channels // reduction_ratio),
+        nn.ReLU(inplace=True),
+        nn.Linear(in_channels // reduction_ratio, in_channels))
+        
+        self.sof=nn.Softmax(dim=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x1,x2):
+        # if self.pool:
+        #     x=self.layer1(x)
+        batch_size, channels, _, _ = x1.size()
+
+        # 全局平均池化
+        squeeze1 = self.global_pooling(x1)
+        squeeze1 = squeeze1.view(batch_size, channels)
+        
+        squeeze2 = self.global_pooling(x2)
+        squeeze2 = squeeze2.view(batch_size, channels)
+
+        # 第一个全连接层 + 激活函数 (ReLU)
+        excitation1 = self.getatt1(squeeze1).unsqueeze(1)
+        excitation2=self.getatt2(squeeze2).unsqueeze(1)
+        x_att=torch.cat([excitation1,excitation2],dim=1)
+        excitation = self.sof(x_att)
+
+        excitation_chunk=excitation.chunk(2,dim=1)
+        # 重塑为通道权重
+        excitation1 = excitation_chunk[0].view(batch_size, channels, 1, 1)
+        excitation2 = excitation_chunk[1].view(batch_size, channels, 1, 1)
+        # 特征重加权
+        x = x1 * excitation1+x2*excitation2
+
+        return x
+class fft_model(nn.Module):
+    def __init__(self,channel_num) -> None:
+        super(fft_model,self).__init__()
+        self.weight=None
+        self.layer=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.Se=SEBlock(channel_num)
+    def reset_parameter(self,x):
+        self.weight = nn.Parameter(torch.Tensor(*x.size())).to(x.device)
+        nn.init.kaiming_normal_(self.weight)
+    def get_filter_low(self,x):
+        h,w=x.shape[-2:]
+        center_h=h//2
+        center_w=w//2
+        cutoff_freq=10
+        fliter=torch.zeros_like(x)
+        fliter[...,:cutoff_freq,:cutoff_freq]=1
+        return fliter
+    def forward(self,x):
+        origin=x
+        if self.weight is None:
+            self.reset_parameter(x)
+        x_fft=torch.fft.fftn(x,dim=(2,3))
+        x=x_fft*self.weight
+        x_mul=torch.fft.ifftn(x,dim=(2,3))
+        x_mul = x_mul.real.float()
+        x=torch.cat([x_mul,origin],dim=1)
+        x=self.layer(x)
+        x=self.Se(x)
+        return x
+
+class frangi_fft1(nn.Module):
+    def __init__(self,channel_num) -> None:
+        super().__init__()
+        self.sig=nn.Sigmoid()
+        self.layer1=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_fft=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_frangi=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.weight=None
+        self.Se=SEBlock(channel_num)
+        self.se_fft=SEBlock_cat(channel_num)
+        self.se_frangi=SEBlock_cat(channel_num)
+        self.weight2=None
+    def reset_parameter(self,x):
+        self.weight = nn.Parameter(torch.Tensor(*x.size())).to(x.device)
+        #self.weight2 = nn.Parameter(torch.Tensor(*x.size())).to(x.device)
+        nn.init.kaiming_normal_(self.weight)
+        #nn.init.kaiming_normal_(self.weight2)
+    def forward(self,x,x_hansin):
+        if self.weight is None:
+            self.reset_parameter(x)
+        origin=x
+        x_frangi=x*x_hansin
+        
+        #x_frangi=x*self.weight2
+        
+        
+        #获取频域特征
+        x_fft=torch.fft.fftn(x,dim=(2,3))
+        #x_frangi=torch.cat([x,x_frangi],dim=1)
+        x_fft=x_fft*self.weight
+        x_fft=torch.fft.ifftn(x_fft,dim=(2,3)).real.float()
+        # x_new1=torch.cat([origin,x_frangi],dim=1)
+        # x_new2=torch.cat([origin,x_fft],dim=1)
+        #修改
+        # x_fft=torch.add(origin,self.Se_fft(x_fft))
+        # x_frangi=torch.add(origin,self.Se_frangi(x_frangi))
+        # x1=self.se1(x_new1)
+        # x2=self.se1(x_new2)
+        
+        #原本的代码
+        # x_new=torch.cat([origin,x_frangi,x_fft],dim=1)
+        # x_new=self.layer1(x_new)
+        # x_new=self.Se(x_new)
+        # return x_new
+        
+        # #先互学习相加
+        # x_fft=self.se1(x_fft)
+        # x_origin_fft=self.se2(x)
+        # x_fft=torch.add(x_fft,x_origin_fft)
+        # x_frangi=self.se3(x_frangi)
+        # x_origin_frangi=self.se4(x)
+        # x_frangi=torch.add(x,x_origin_frangi)
+        # x_new=torch.cat([x_fft,x_frangi],dim=1)
+        # x_new=self.layer1(x_new)        
+        # return x_new
+        
+        #升级版互学习
+        x_frangi=self.se_frangi(origin,x_frangi)
+        x_fft=self.se_fft(origin,x_fft)
+        x_new=torch.cat([x_fft,x_frangi],dim=1)
+        x_new=self.layer1(x_new)        
+        return x_new
+class frangi_fft_origin_fftcatse(nn.Module):
+    def __init__(self,channel_num) -> None:
+        super().__init__()
+        self.sig=nn.Sigmoid()
+        self.layer1=nn.Sequential(
+            nn.Conv2d(channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_fft=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_frangi=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.weight=None
+        self.Se=SEBlock(channel_num)
+        # self.Se_fft=SEBlock(channel_num)
+        # self.Se_frangi=SEBlock(channel_num)
+        self.se1=SEBlock(channel_num)
+        self.se2=SEBlock(channel_num)
+        self.se3=SEBlock(channel_num)
+        self.se4=SEBlock(channel_num)
+        self.se_fft=SEBlock_cat(channel_num)
+        self.se_frangi=SEBlock_cat(channel_num)
+    def reset_parameter(self,x):
+        self.weight = nn.Parameter(torch.Tensor(*x.size())).to(x.device)
+        nn.init.kaiming_normal_(self.weight)
+    def forward(self,x,x_hansin):
+        if self.weight is None:
+            self.reset_parameter(x)
+        origin=x
+        x_frangi=x*x_hansin
+        
+        #获取频域特征
+        x_fft=torch.fft.fftn(x,dim=(2,3))
+        #x_frangi=torch.cat([x,x_frangi],dim=1)
+        x_fft=x_fft*self.weight
+        x_fft=torch.fft.ifftn(x_fft,dim=(2,3)).real.float()
+        # x_new1=torch.cat([origin,x_frangi],dim=1)
+        # x_new2=torch.cat([origin,x_fft],dim=1)
+        #修改
+        # x_fft=torch.add(origin,self.Se_fft(x_fft))
+        # x_frangi=torch.add(origin,self.Se_frangi(x_frangi))
+        # x1=self.se1(x_new1)
+        # x2=self.se1(x_new2)
+        
+        #原本的代码
+        # x_new=torch.cat([origin,x_frangi,x_fft],dim=1)
+        # x_new=self.layer1(x_new)
+        # x_new=self.Se(x_new)
+        # return x_new
+        
+        # #先互学习相加
+        # x_fft=self.se1(x_fft)
+        # x_origin_fft=self.se2(x)
+        # x_fft=torch.add(x_fft,x_origin_fft)
+        # x_frangi=self.se3(x_frangi)
+        # x_origin_frangi=self.se4(x)
+        # x_frangi=torch.add(x,x_origin_frangi)
+        # x_new=torch.cat([x_fft,x_frangi],dim=1)
+        # x_new=self.layer1(x_new)        
+        # return x_new
+        
+        #升级版互学习
+        #x_frangi=self.se_frangi(origin,x_frangi)
+        x_fft=self.se_fft(origin,x_fft)
+        #x_new=torch.cat([x_fft,x_frangi],dim=1)
+        x_new=self.layer1(x_fft)        
+        return x_new
+class frangi_fft_origin_frangicatse(nn.Module):
+    def __init__(self,channel_num) -> None:
+        super().__init__()
+        self.sig=nn.Sigmoid()
+        self.layer1=nn.Sequential(
+            nn.Conv2d(channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_fft=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_frangi=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.weight=None
+        self.Se=SEBlock(channel_num)
+        # self.Se_fft=SEBlock(channel_num)
+        # self.Se_frangi=SEBlock(channel_num)
+        self.se1=SEBlock(channel_num)
+        self.se2=SEBlock(channel_num)
+        self.se3=SEBlock(channel_num)
+        self.se4=SEBlock(channel_num)
+        self.se_fft=SEBlock_cat(channel_num)
+        self.se_frangi=SEBlock_cat(channel_num)
+    def reset_parameter(self,x):
+        self.weight = nn.Parameter(torch.Tensor(*x.size())).to(x.device)
+        nn.init.kaiming_normal_(self.weight)
+    def forward(self,x,x_hansin):
+        if self.weight is None:
+            self.reset_parameter(x)
+        origin=x
+        x_frangi=x*x_hansin
+        
+        #获取频域特征
+        x_fft=torch.fft.fftn(x,dim=(2,3))
+        #x_frangi=torch.cat([x,x_frangi],dim=1)
+        x_fft=x_fft*self.weight
+        x_fft=torch.fft.ifftn(x_fft,dim=(2,3)).real.float()
+        # x_new1=torch.cat([origin,x_frangi],dim=1)
+        # x_new2=torch.cat([origin,x_fft],dim=1)
+        #修改
+        # x_fft=torch.add(origin,self.Se_fft(x_fft))
+        # x_frangi=torch.add(origin,self.Se_frangi(x_frangi))
+        # x1=self.se1(x_new1)
+        # x2=self.se1(x_new2)
+        
+        #原本的代码
+        # x_new=torch.cat([origin,x_frangi,x_fft],dim=1)
+        # x_new=self.layer1(x_new)
+        # x_new=self.Se(x_new)
+        # return x_new
+        
+        # #先互学习相加
+        # x_fft=self.se1(x_fft)
+        # x_origin_fft=self.se2(x)
+        # x_fft=torch.add(x_fft,x_origin_fft)
+        # x_frangi=self.se3(x_frangi)
+        # x_origin_frangi=self.se4(x)
+        # x_frangi=torch.add(x,x_origin_frangi)
+        # x_new=torch.cat([x_fft,x_frangi],dim=1)
+        # x_new=self.layer1(x_new)        
+        # return x_new
+        
+        #升级版互学习
+        x_frangi=self.se_frangi(origin,x_frangi)
+        # x_fft=self.se_fft(origin,x_fft)
+        # x_new=torch.cat([x_fft,x_frangi],dim=1)
+        x_new=self.layer1(x_frangi)        
+        return x_new
+class frangi_fft_fftcatfrangi(nn.Module):
+    '''
+    消融实验1,添加fft和frangi
+    '''
+    def __init__(self,channel_num) -> None:
+        super().__init__()
+        self.sig=nn.Sigmoid()
+        self.layer1=nn.Sequential(
+            nn.Conv2d(3*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_fft=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_frangi=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.weight=None
+        self.Se=SEBlock(channel_num)
+        # self.Se_fft=SEBlock(channel_num)
+        # self.Se_frangi=SEBlock(channel_num)
+        self.se_fft=SEBlock_cat(channel_num)
+        self.se_frangi=SEBlock_cat(channel_num)
+    def reset_parameter(self,x):
+        self.weight = nn.Parameter(torch.Tensor(*x.size())).to(x.device)
+        nn.init.kaiming_normal_(self.weight)
+    def forward(self,x,x_hansin):
+        if self.weight is None:
+            self.reset_parameter(x)
+        origin=x
+        x_frangi=x*x_hansin
+        
+        #获取频域特征
+        x_fft=torch.fft.fftn(x,dim=(2,3))
+        #x_frangi=torch.cat([x,x_frangi],dim=1)
+        x_fft=x_fft*self.weight
+        x_fft=torch.fft.ifftn(x_fft,dim=(2,3)).real.float()
+        
+        #升级版互学习
+        #x_frangi=self.se_frangi(origin,x_frangi)
+        #x_fft=self.se_fft(origin,x_fft)
+        x_new=torch.cat([origin,x_fft,x_frangi],dim=1)
+        x_new=self.layer1(x_new)  
+        x_new=self.Se(x_new)
+        #效果不行在后面再加上se      
+        return x_new        
+class frangi_fft_aba_onlyfrangi(nn.Module):
+    '''
+    消融实验,只有frangi
+    '''
+    def __init__(self,channel_num) -> None:
+        super().__init__()
+        self.sig=nn.Sigmoid()
+        self.layer1=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_fft=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_frangi=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.weight=None
+        self.Se=SEBlock(channel_num)
+        # self.Se_fft=SEBlock(channel_num)
+        # self.Se_frangi=SEBlock(channel_num)
+        self.se1=SEBlock(channel_num)
+        self.se2=SEBlock(channel_num)
+        self.se3=SEBlock(channel_num)
+        self.se4=SEBlock(channel_num)
+        self.se_fft=SEBlock_cat(channel_num)
+        self.se_frangi=SEBlock_cat(channel_num)
+    def reset_parameter(self,x):
+        self.weight = nn.Parameter(torch.Tensor(*x.size())).to(x.device)
+        nn.init.kaiming_normal_(self.weight)
+    def forward(self,x,x_hansin):
+        if self.weight is None:
+            self.reset_parameter(x)
+        origin=x
+        x_frangi=x*x_hansin
+        
+        #获取频域特征
+        # x_fft=torch.fft.fftn(x,dim=(2,3))
+        # #x_frangi=torch.cat([x,x_frangi],dim=1)
+        # x_fft=x_fft*self.weight
+        # x_fft=torch.fft.ifftn(x_fft,dim=(2,3)).real.float()
+        
+        #升级版互学习
+        # x_frangi=self.se_frangi(origin,x_frangi)
+        # x_fft=self.se_fft(origin,x_fft)
+        x_new=torch.cat([x_frangi,origin],dim=1)
+        x_new=self.layer1(x_new)   
+        #如果效果不好，在后面再加上se     
+        return x_new
+class frangi_fft_aba_onlyfft(nn.Module):
+    '''
+    消融实验,只有fft
+    '''
+    def __init__(self,channel_num) -> None:
+        super().__init__()
+        self.sig=nn.Sigmoid()
+        self.layer1=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_fft=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.layer_frangi=nn.Sequential(
+            nn.Conv2d(2*channel_num,channel_num,kernel_size=1),
+            # nn.LayerNorm([channel_num,w,w]),
+            # nn.GELU()
+            nn.BatchNorm2d(channel_num),
+            nn.ReLU(inplace=True)
+        )
+        self.weight=None
+        self.Se=SEBlock(channel_num)
+        # self.Se_fft=SEBlock(channel_num)
+        # self.Se_frangi=SEBlock(channel_num)
+        self.se1=SEBlock(channel_num)
+        self.se2=SEBlock(channel_num)
+        self.se3=SEBlock(channel_num)
+        self.se4=SEBlock(channel_num)
+        self.se_fft=SEBlock_cat(channel_num)
+        self.se_frangi=SEBlock_cat(channel_num)
+    def reset_parameter(self,x):
+        self.weight = nn.Parameter(torch.Tensor(*x.size())).to(x.device)
+        nn.init.kaiming_normal_(self.weight)
+    def forward(self,x,x_hansin):
+        if self.weight is None:
+            self.reset_parameter(x)
+        origin=x
+        # x_frangi=x*x_hansin
+        
+        #获取频域特征
+        x_fft=torch.fft.fftn(x,dim=(2,3))
+        #x_frangi=torch.cat([x,x_frangi],dim=1)
+        x_fft=x_fft*self.weight
+        x_fft=torch.fft.ifftn(x_fft,dim=(2,3)).real.float()
+        
+        #升级版互学习
+        # x_frangi=self.se_frangi(origin,x_frangi)
+        # x_fft=self.se_fft(origin,x_fft)
+        x_new=torch.cat([x_fft,origin],dim=1)
+        x_new=self.layer1(x_new)   
+          
+        return x_new   
+
+class mymodel_googlenet(GoogLeNet):
+    def __init__(self, num_classes: int = 2, aux_logits: bool = False, transform_input: bool = False, init_weights:Optional[bool] = None, blocks:Optional[List[Callable[..., nn.Module]]] = None, dropout: float = 0.2, dropout_aux: float = 0.7) -> None:
+        super().__init__(num_classes, aux_logits, transform_input, init_weights, blocks, dropout, dropout_aux)
+        self.fft1=frangi_fft1(480)
+        # self.fft2=frangi_fft1(1024)
+        # self.fft_aba1=frangi_fft1(64)
+        # self.fft_aba2=frangi_fft1(192)
+        #self.fft_aba3=frangi_fft1(480)
+        # self.fft_aba4=frangi_fft1(832)
+        # self.fft_aba5=frangi_fft1(1024)
+    
+    def _forward(self, x: Tensor,x_hansin) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor]]:
+        # N x 3 x 224 x 224
+        x_hansin=x_hansin.unsqueeze(1)
+        x = self.conv1(x)
+        # N x 64 x 112 x 112
+        x = self.maxpool1(x)
+        # x_hansin=F.adaptive_avg_pool2d(x_hansin,(56,56))
+        # x=self.fft_aba1(x,x_hansin)
+        # N x 64 x 56 x 56
+        x = self.conv2(x)
+        # N x 64 x 56 x 56
+        x = self.conv3(x)
+        # N x 192 x 56 x 56
+        x = self.maxpool2(x)
+        # x_hansin=F.adaptive_avg_pool2d(x_hansin,(28,28))
+        # x=self.fft_aba2(x,x_hansin)
+        # N x 192 x 28 x 28
+        x = self.inception3a(x)
+        # N x 256 x 28 x 28
+        x = self.inception3b(x)
+        # N x 480 x 28 x 28
+        x = self.maxpool3(x)
+        # x_hansin=F.adaptive_avg_pool2d(x_hansin,(14,14))
+        # x=self.fft_aba3(x,x_hansin)
+        if x_hansin is not None:
+            x_hansin=F.adaptive_avg_pool2d(x_hansin,(14,14))
+            x=self.fft1(x,x_hansin)
+        # x_hansin=F.adaptive_avg_pool2d(x_hansin,(14,14))
+        # x=self.fft_aba3(x,x_hansin)
+        
+        # N x 480 x 14 x 14
+        x = self.inception4a(x)
+        # N x 512 x 14 x 14
+        aux1: Optional[Tensor] = None
+        if self.aux1 is not None:
+            if self.training:
+                aux1 = self.aux1(x)
+
+        x = self.inception4b(x)
+        # N x 512 x 14 x 14
+        x = self.inception4c(x)
+        # N x 512 x 14 x 14
+        x = self.inception4d(x)
+        # N x 528 x 14 x 14
+        
+        aux2: Optional[Tensor] = None
+        if self.aux2 is not None:
+            if self.training:
+                aux2 = self.aux2(x)
+
+        x = self.inception4e(x)
+        # N x 832 x 14 x 14
+        x = self.maxpool4(x)
+        # N x 832 x 7 x 7
+        # x_hansin=F.adaptive_avg_pool2d(x_hansin,(7,7))
+        # # self.fft2(x,x_hansin)
+        # x=self.fft_aba4(x,x_hansin)
+        
+        x = self.inception5a(x)
+        # N x 832 x 7 x 7
+        x = self.inception5b(x)
+        # if x_hansin is not None:
+        #     x_hansin=F.adaptive_avg_pool2d(x_hansin,(7,7))
+        #     x=self.fft2(x,x_hansin)
+        # x_hansin=F.adaptive_avg_pool2d(x_hansin,(7,7))
+        # self.fft2(x,x_hansin)
+        # x_hansin=F.adaptive_avg_pool2d(x_hansin,(7,7))
+        # x=self.fft_aba5(x,x_hansin)
+        # x_hansin=F.adaptive_avg_pool2d(x_hansin,(7,7))
+        # x=self.fft_aba5(x,x_hansin)
+        # N x 1024 x 7 x 7
+        # x_hansin=F.adaptive_avg_pool2d(x_hansin,(7,7))
+        # x=self.fft_aba5(x,x_hansin)
+        # if x_hansin is not None:
+        #     x_hansin=F.adaptive_avg_pool2d(x_hansin,(7,7))
+        #     self.fft2(x,x_hansin)
+        x = self.avgpool(x)
+        # N x 1024 x 1 x 1
+        x = torch.flatten(x, 1)
+        # N x 1024
+        x = self.dropout(x)
+        x = self.fc(x)
+        # N x 1000 (num_classes)
+        return x, aux2, aux1
+    def forward(self, x: Tensor,x_hansin:None) -> GoogLeNetOutputs:
+        x = self._transform_input(x)
+        x, aux1, aux2 = self._forward(x,x_hansin)
+        aux_defined = self.training and self.aux_logits
+        if torch.jit.is_scripting():
+            if not aux_defined:
+                warnings.warn("Scripted GoogleNet always returns GoogleNetOutputs Tuple")
+            return GoogLeNetOutputs(x, aux2, aux1)
+        else:
+            return self.eager_outputs(x, aux2, aux1)
